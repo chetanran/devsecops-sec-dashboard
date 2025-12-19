@@ -2,7 +2,9 @@ name: Security Scan
 
 on:
   push:
-    branches: [setghubaction]
+    branches: ['*']
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -20,19 +22,7 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
       - name: Run Python security scans
-        run: |
-          pip install --upgrade pip
-          pip install -r backend/requirements.txt pip-audit bandit safety
-
-          # pip-audit (run from root on backend requirements)
-          pip-audit --requirement backend/requirements.txt --format json --output backend/pip-audit-report.json 2>&1 || echo '{"dependencies":[],"vulnerabilities":[]}' > backend/pip-audit-report.json
-
-          # bandit (scan only backend directory)
-          bandit -r backend/ -f json -o backend/bandit-report.json 2>&1 || echo '{"results":[],"metrics":{"_totals":{"CONFIDENCE.HIGH":0,"SEVERITY.HIGH":0}}}' > backend/bandit-report.json
-
-          # safety (skip if fails - requires API key)
-          cd backend
-          safety check --json --output safety-report.json 2>&1 || echo '{"report_meta":{},"scanned_packages":[],"affected_packages":[],"announcements":[]}' > safety-report.json
+        run: bash scripts/scan-python-security.sh
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -52,26 +42,31 @@ jobs:
           cache: 'npm'
           cache-dependency-path: frontend/package-lock.json
       - name: Run NPM security scans
-        run: |
-          cd frontend
-          npm install --legacy-peer-deps
-
-          # npm audit - exit code 0 even with vulnerabilities for proper JSON output
-          npm audit --json --audit-level=none > npm-audit-report.json 2>&1 || true
-
-          # Ensure valid JSON even if npm audit failed
-          if [ ! -s npm-audit-report.json ] || ! jq empty npm-audit-report.json 2>/dev/null; then
-            echo '{"vulnerabilities":{},"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0}}}' > npm-audit-report.json
-          fi
-
-          # retire.js
-          npx retire --outputformat json --outputpath retire-report.json 2>&1 || echo '[]' > retire-report.json
+        run: bash scripts/scan-npm-security.sh
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: npm-reports
           path: frontend/*-report.json
+          retention-days: 30
+
+  semgrep-sast:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run Semgrep SAST
+        run: bash scripts/scan-semgrep.sh
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
           retention-days: 30
 
   secret-scanning:
@@ -82,10 +77,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run Gitleaks
-        run: |
-          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
-          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
-          ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || echo '[]' > gitleaks-report.json
+        run: bash scripts/scan-gitleaks.sh
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -97,7 +89,7 @@ jobs:
   security-summary:
     name: Security Summary
     runs-on: ubuntu-latest
-    needs: [python-security, npm-security, secret-scanning]
+    needs: [python-security, npm-security, semgrep-sast, secret-scanning]
     if: always()
     steps:
       - uses: actions/download-artifact@v4
@@ -108,21 +100,13 @@ jobs:
           # Parse Python reports
           PIP_AUDIT_COUNT=0
           BANDIT_COUNT=0
-          SAFETY_COUNT=0
 
           if [ -f python-reports/pip-audit-report.json ]; then
-            # pip-audit format: count dependencies with vulnerabilities
             PIP_AUDIT_COUNT=$(jq -r '[.dependencies[]? | select(.vulns | length > 0)] | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
-            # Alternative: count total vulnerabilities across all packages
-            # PIP_AUDIT_VULNS=$(jq -r '[.dependencies[]?.vulns[]?] | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
           fi
 
           if [ -f python-reports/bandit-report.json ]; then
             BANDIT_COUNT=$(jq -r '.results | length // 0' python-reports/bandit-report.json 2>/dev/null || echo 0)
-          fi
-
-          if [ -f python-reports/safety-report.json ]; then
-            SAFETY_COUNT=$(jq -r '.affected_packages | length // 0' python-reports/safety-report.json 2>/dev/null || echo 0)
           fi
 
           # Parse NPM reports
@@ -130,7 +114,6 @@ jobs:
           NPM_HIGH=0
           NPM_MODERATE=0
           NPM_LOW=0
-          RETIRE_COUNT=0
 
           if [ -f npm-reports/npm-audit-report.json ]; then
             NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
@@ -139,8 +122,14 @@ jobs:
             NPM_LOW=$(jq -r '.metadata.vulnerabilities.low // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
           fi
 
-          if [ -f npm-reports/retire-report.json ]; then
-            RETIRE_COUNT=$(jq -r '. | length // 0' npm-reports/retire-report.json 2>/dev/null || echo 0)
+          # Parse Semgrep report
+          SEMGREP_TOTAL=0
+          SEMGREP_ERROR=0
+          SEMGREP_WARNING=0
+          if [ -f semgrep-report/semgrep-report.json ]; then
+            SEMGREP_TOTAL=$(jq -r '.results | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
+            SEMGREP_ERROR=$(jq -r '[.results[] | select(.extra.severity == "ERROR")] | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
+            SEMGREP_WARNING=$(jq -r '[.results[] | select(.extra.severity == "WARNING")] | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
           fi
 
           # Parse Gitleaks report
@@ -161,6 +150,7 @@ jobs:
           |-----|--------|
           | Python Security | ${{ needs.python-security.result }} |
           | NPM Security | ${{ needs.npm-security.result }} |
+          | Semgrep SAST | ${{ needs.semgrep-sast.result }} |
           | Secret Scanning | ${{ needs.secret-scanning.result }} |
 
           ### 🐍 Python Security Findings
@@ -168,7 +158,6 @@ jobs:
           |------|----------|
           | pip-audit | ${PIP_AUDIT_COUNT} vulnerable packages |
           | Bandit (SAST) | ${BANDIT_COUNT} code issues |
-          | Safety | ${SAFETY_COUNT} affected packages |
 
           ### 📦 NPM Security Findings
           | Severity | Count |
@@ -178,7 +167,13 @@ jobs:
           | Moderate | ${NPM_MODERATE} |
           | Low | ${NPM_LOW} |
           | **Total** | **${NPM_TOTAL}** |
-          | retire.js | ${RETIRE_COUNT} vulnerable libraries |
+
+          ### 🔍 Semgrep SAST Findings
+          | Category | Count |
+          |----------|-------|
+          | Total Findings | ${SEMGREP_TOTAL} |
+          | Error Severity | ${SEMGREP_ERROR} |
+          | Warning Severity | ${SEMGREP_WARNING} |
 
           ### 🔐 Secret Scanning Findings
           | Tool | Findings |
@@ -186,8 +181,9 @@ jobs:
           | Gitleaks | ${SECRETS_COUNT} potential secrets |
 
           ### 📥 Artifact Downloads
-          - **python-reports**: pip-audit, bandit, safety JSON reports
-          - **npm-reports**: npm-audit, retire.js JSON reports
+          - **python-reports**: pip-audit, bandit JSON reports
+          - **npm-reports**: npm-audit JSON report
+          - **semgrep-report**: semgrep SAST JSON report
           - **gitleaks-report**: gitleaks JSON report
 
           All artifacts retained for 30 days.
