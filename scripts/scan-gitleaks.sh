@@ -46,7 +46,8 @@ fi
 
 log "Running Gitleaks scan..."
 # Gitleaks exits with code 1 when leaks are found, which is expected
-$GITLEAKS_CMD detect --source . --report-format json --report-path gitleaks-report.json --no-git || true
+# --no-banner: Suppress ASCII art logo
+$GITLEAKS_CMD detect --source . --report-format json --report-path gitleaks-report.json --no-git --no-banner 2>&1 || true
 
 # If file doesn't exist or is empty, create fallback
 if [ ! -s gitleaks-report.json ]; then
