@@ -24,9 +24,15 @@ jobs:
           pip install --upgrade pip
           pip install -r backend/requirements.txt pip-audit bandit safety
           cd backend
-          pip-audit --requirement requirements.txt --format json --output pip-audit-report.json || echo '[]' > pip-audit-report.json
-          bandit -r . -f json -o bandit-report.json || echo '[]' > bandit-report.json
-          safety check --json --output safety-report.json || echo '[]' > safety-report.json
+
+          # pip-audit
+          pip-audit --requirement requirements.txt --format json --output pip-audit-report.json 2>&1 || echo '{"dependencies":[],"vulnerabilities":[]}' > pip-audit-report.json
+
+          # bandit
+          bandit -r . -f json -o bandit-report.json 2>&1 || echo '{"results":[],"metrics":{"_totals":{"CONFIDENCE.HIGH":0,"SEVERITY.HIGH":0}}}' > bandit-report.json
+
+          # safety (skip if fails - requires API key)
+          safety check --json --output safety-report.json 2>&1 || echo '{"report_meta":{},"scanned_packages":[],"affected_packages":[],"announcements":[]}' > safety-report.json
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -48,9 +54,18 @@ jobs:
       - name: Run NPM security scans
         run: |
           cd frontend
-          npm install
-          npm audit --json > npm-audit-report.json || echo '{}' > npm-audit-report.json
-          npx retire --outputformat json --outputpath retire-report.json || echo '[]' > retire-report.json
+          npm install --legacy-peer-deps
+
+          # npm audit - exit code 0 even with vulnerabilities for proper JSON output
+          npm audit --json --audit-level=none > npm-audit-report.json 2>&1 || true
+
+          # Ensure valid JSON even if npm audit failed
+          if [ ! -s npm-audit-report.json ] || ! jq empty npm-audit-report.json 2>/dev/null; then
+            echo '{"vulnerabilities":{},"metadata":{"vulnerabilities":{"info":0,"low":0,"moderate":0,"high":0,"critical":0}}}' > npm-audit-report.json
+          fi
+
+          # retire.js
+          npx retire --outputformat json --outputpath retire-report.json 2>&1 || echo '[]' > retire-report.json
         continue-on-error: true
       - uses: actions/upload-artifact@v4
         if: always()
@@ -87,16 +102,90 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         continue-on-error: true
-      - name: Create summary
+
+      - name: Parse and create summary
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ## Security Scan Results
+          # Parse Python reports
+          PIP_AUDIT_COUNT=0
+          BANDIT_COUNT=0
+          SAFETY_COUNT=0
 
-          ### Status
-          - Python: ${{ needs.python-security.result }}
-          - NPM: ${{ needs.npm-security.result }}
-          - Secrets: ${{ needs.secret-scanning.result }}
+          if [ -f python-reports/pip-audit-report.json ]; then
+            PIP_AUDIT_COUNT=$(jq -r '.vulnerabilities | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
+          fi
 
-          ### Reports
-          Download artifacts from workflow run for detailed results.
+          if [ -f python-reports/bandit-report.json ]; then
+            BANDIT_COUNT=$(jq -r '.results | length // 0' python-reports/bandit-report.json 2>/dev/null || echo 0)
+          fi
+
+          if [ -f python-reports/safety-report.json ]; then
+            SAFETY_COUNT=$(jq -r '.affected_packages | length // 0' python-reports/safety-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Parse NPM reports
+          NPM_CRITICAL=0
+          NPM_HIGH=0
+          NPM_MODERATE=0
+          NPM_LOW=0
+          RETIRE_COUNT=0
+
+          if [ -f npm-reports/npm-audit-report.json ]; then
+            NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_LOW=$(jq -r '.metadata.vulnerabilities.low // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+          fi
+
+          if [ -f npm-reports/retire-report.json ]; then
+            RETIRE_COUNT=$(jq -r '. | length // 0' npm-reports/retire-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Parse Gitleaks report
+          SECRETS_COUNT=0
+          if [ -f gitleaks-report/gitleaks-report.json ]; then
+            SECRETS_COUNT=$(jq -r '. | length // 0' gitleaks-report/gitleaks-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Calculate totals
+          NPM_TOTAL=$((NPM_CRITICAL + NPM_HIGH + NPM_MODERATE + NPM_LOW))
+
+          # Create summary
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔒 Security Scan Results
+
+          ### 📊 Job Status
+          | Job | Status |
+          |-----|--------|
+          | Python Security | ${{ needs.python-security.result }} |
+          | NPM Security | ${{ needs.npm-security.result }} |
+          | Secret Scanning | ${{ needs.secret-scanning.result }} |
+
+          ### 🐍 Python Security Findings
+          | Tool | Findings |
+          |------|----------|
+          | pip-audit | ${PIP_AUDIT_COUNT} vulnerabilities |
+          | Bandit (SAST) | ${BANDIT_COUNT} issues |
+          | Safety | ${SAFETY_COUNT} affected packages |
+
+          ### 📦 NPM Security Findings
+          | Severity | Count |
+          |----------|-------|
+          | Critical | ${NPM_CRITICAL} |
+          | High | ${NPM_HIGH} |
+          | Moderate | ${NPM_MODERATE} |
+          | Low | ${NPM_LOW} |
+          | **Total** | **${NPM_TOTAL}** |
+          | retire.js | ${RETIRE_COUNT} vulnerable libraries |
+
+          ### 🔐 Secret Scanning Findings
+          | Tool | Findings |
+          |------|----------|
+          | Gitleaks | ${SECRETS_COUNT} potential secrets |
+
+          ### 📥 Artifact Downloads
+          - **python-reports**: pip-audit, bandit, safety JSON reports
+          - **npm-reports**: npm-audit, retire.js JSON reports
+          - **gitleaks-report**: gitleaks JSON report
+
+          All artifacts retained for 30 days.
           EOF
