@@ -23,15 +23,15 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r backend/requirements.txt pip-audit bandit safety
-          cd backend
 
-          # pip-audit
-          pip-audit --requirement requirements.txt --format json --output pip-audit-report.json 2>&1 || echo '{"dependencies":[],"vulnerabilities":[]}' > pip-audit-report.json
+          # pip-audit (run from root on backend requirements)
+          pip-audit --requirement backend/requirements.txt --format json --output backend/pip-audit-report.json 2>&1 || echo '{"dependencies":[],"vulnerabilities":[]}' > backend/pip-audit-report.json
 
-          # bandit
-          bandit -r . -f json -o bandit-report.json 2>&1 || echo '{"results":[],"metrics":{"_totals":{"CONFIDENCE.HIGH":0,"SEVERITY.HIGH":0}}}' > bandit-report.json
+          # bandit (scan only backend directory)
+          bandit -r backend/ -f json -o backend/bandit-report.json 2>&1 || echo '{"results":[],"metrics":{"_totals":{"CONFIDENCE.HIGH":0,"SEVERITY.HIGH":0}}}' > backend/bandit-report.json
 
           # safety (skip if fails - requires API key)
+          cd backend
           safety check --json --output safety-report.json 2>&1 || echo '{"report_meta":{},"scanned_packages":[],"affected_packages":[],"announcements":[]}' > safety-report.json
         continue-on-error: true
       - uses: actions/upload-artifact@v4
@@ -111,7 +111,10 @@ jobs:
           SAFETY_COUNT=0
 
           if [ -f python-reports/pip-audit-report.json ]; then
-            PIP_AUDIT_COUNT=$(jq -r '.vulnerabilities | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
+            # pip-audit format: count dependencies with vulnerabilities
+            PIP_AUDIT_COUNT=$(jq -r '[.dependencies[]? | select(.vulns | length > 0)] | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
+            # Alternative: count total vulnerabilities across all packages
+            # PIP_AUDIT_VULNS=$(jq -r '[.dependencies[]?.vulns[]?] | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
           fi
 
           if [ -f python-reports/bandit-report.json ]; then
@@ -163,8 +166,8 @@ jobs:
           ### 🐍 Python Security Findings
           | Tool | Findings |
           |------|----------|
-          | pip-audit | ${PIP_AUDIT_COUNT} vulnerabilities |
-          | Bandit (SAST) | ${BANDIT_COUNT} issues |
+          | pip-audit | ${PIP_AUDIT_COUNT} vulnerable packages |
+          | Bandit (SAST) | ${BANDIT_COUNT} code issues |
           | Safety | ${SAFETY_COUNT} affected packages |
 
           ### 📦 NPM Security Findings
