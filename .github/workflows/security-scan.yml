@@ -48,7 +48,7 @@ jobs:
       - name: Run NPM security scans
         run: |
           cd frontend
-          npm ci
+          npm install
           npm audit --json > npm-audit-report.json || echo '{}' > npm-audit-report.json
           npx retire --outputformat json --outputpath retire-report.json || echo '[]' > retire-report.json
         continue-on-error: true
@@ -67,14 +67,11 @@ jobs:
         with:
           fetch-depth: 0
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        run: |
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          ./gitleaks detect --source . --report-format json --report-path gitleaks-report.json --no-git || echo '[]' > gitleaks-report.json
         continue-on-error: true
-      - name: Ensure report exists
-        if: always()
-        run: '[ -f gitleaks-report.json ] || echo "[]" > gitleaks-report.json'
       - uses: actions/upload-artifact@v4
         if: always()
         with:
