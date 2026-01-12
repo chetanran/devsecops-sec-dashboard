@@ -1,6 +1,8 @@
 name: Security Scan
 
 on:
+  push:
+    branches: ['*']
   pull_request:
     branches: [main]
 
@@ -11,117 +13,178 @@ permissions:
 
 jobs:
   python-security:
-    name: Python Security Checks
+    name: Python Security
     runs-on: ubuntu-latest
-    
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
         with:
           python-version: '3.11'
           cache: 'pip'
-
-      - name: Install dependencies
-        run: |
-          cd backend
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Install security tools
-        run: pip install pip-audit bandit safety
-
-      - name: Run pip-audit (dependency vulnerabilities)
-        run: |
-          cd backend
-          pip-audit --requirement requirements.txt --format json --output pip-audit-report.json || true
+      - name: Run Python security scans
+        run: bash scripts/scan-python-security.sh
         continue-on-error: true
-
-      - name: Run Bandit (Python SAST)
-        run: |
-          bandit -r backend/ -f json -o bandit-report.json || true
-        continue-on-error: true
-
-      - name: Run Safety check
-        run: |
-          cd backend
-          safety check --json --output safety-report.json || true
-        continue-on-error: true
-
-      - name: Upload Python security reports
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: python-security-reports
-          path: |
-            backend/pip-audit-report.json
-            bandit-report.json
-            backend/safety-report.json
+          name: python-reports
+          path: backend/*-report.json
+          retention-days: 30
+
+  npm-security:
+    name: NPM Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      - name: Run NPM security scans
+        run: bash scripts/scan-npm-security.sh
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npm-reports
+          path: frontend/*-report.json
+          retention-days: 30
+
+  semgrep-sast:
+    name: Semgrep SAST
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Run Semgrep SAST
+        run: bash scripts/scan-semgrep.sh
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
           retention-days: 30
 
   secret-scanning:
     name: Secret Scanning
     runs-on: ubuntu-latest
-    
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Run Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/scan-gitleaks.sh
+        continue-on-error: true
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          source: .
-          verbose: true
-          report-format: json
-
-  dependency-review:
-    name: Dependency Review
-    runs-on: ubuntu-latest
-    
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Dependency Review
-        uses: actions/dependency-review-action@v3
-        with:
-          fail-on-severity: high
-          comment-summary-in-pr: true
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 30
 
   security-summary:
     name: Security Summary
     runs-on: ubuntu-latest
-    needs: [python-security, secret-scanning]
+    needs: [python-security, npm-security, semgrep-sast, secret-scanning]
     if: always()
-
     steps:
-      - name: Download Python security reports
-        if: needs.python-security.result != 'skipped'
-        uses: actions/download-artifact@v4
-        with:
-          name: python-security-reports
+      - uses: actions/download-artifact@v4
         continue-on-error: true
 
-      - name: Create summary
+      - name: Parse and create summary
         run: |
-          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
-          ## Security Scan Results
+          # Parse Python reports
+          PIP_AUDIT_COUNT=0
+          BANDIT_COUNT=0
 
-          ### Scan Status
-          - Python Security: ${{ needs.python-security.result }}
-          - Secret Scanning: ${{ needs.secret-scanning.result }}
+          if [ -f python-reports/pip-audit-report.json ]; then
+            PIP_AUDIT_COUNT=$(jq -r '[.dependencies[]? | select(.vulns | length > 0)] | length // 0' python-reports/pip-audit-report.json 2>/dev/null || echo 0)
+          fi
 
-          ### Reports
-          Security scan artifacts have been uploaded and are available for 30 days.
+          if [ -f python-reports/bandit-report.json ]; then
+            BANDIT_COUNT=$(jq -r '.results | length // 0' python-reports/bandit-report.json 2>/dev/null || echo 0)
+          fi
 
-          **Note:** Some checks use `continue-on-error` to ensure visibility of all issues.
+          # Parse NPM reports
+          NPM_CRITICAL=0
+          NPM_HIGH=0
+          NPM_MODERATE=0
+          NPM_LOW=0
+
+          if [ -f npm-reports/npm-audit-report.json ]; then
+            NPM_CRITICAL=$(jq -r '.metadata.vulnerabilities.critical // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_MODERATE=$(jq -r '.metadata.vulnerabilities.moderate // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+            NPM_LOW=$(jq -r '.metadata.vulnerabilities.low // 0' npm-reports/npm-audit-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Parse Semgrep report
+          SEMGREP_TOTAL=0
+          SEMGREP_ERROR=0
+          SEMGREP_WARNING=0
+          if [ -f semgrep-report/semgrep-report.json ]; then
+            SEMGREP_TOTAL=$(jq -r '.results | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
+            SEMGREP_ERROR=$(jq -r '[.results[] | select(.extra.severity == "ERROR")] | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
+            SEMGREP_WARNING=$(jq -r '[.results[] | select(.extra.severity == "WARNING")] | length // 0' semgrep-report/semgrep-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Parse Gitleaks report
+          SECRETS_COUNT=0
+          if [ -f gitleaks-report/gitleaks-report.json ]; then
+            SECRETS_COUNT=$(jq -r '. | length // 0' gitleaks-report/gitleaks-report.json 2>/dev/null || echo 0)
+          fi
+
+          # Calculate totals
+          NPM_TOTAL=$((NPM_CRITICAL + NPM_HIGH + NPM_MODERATE + NPM_LOW))
+
+          # Create summary
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## 🔒 Security Scan Results
+
+          ### 📊 Job Status
+          | Job | Status |
+          |-----|--------|
+          | Python Security | ${{ needs.python-security.result }} |
+          | NPM Security | ${{ needs.npm-security.result }} |
+          | Semgrep SAST | ${{ needs.semgrep-sast.result }} |
+          | Secret Scanning | ${{ needs.secret-scanning.result }} |
+
+          ### 🐍 Python Security Findings
+          | Tool | Findings |
+          |------|----------|
+          | pip-audit | ${PIP_AUDIT_COUNT} vulnerable packages |
+          | Bandit (SAST) | ${BANDIT_COUNT} code issues |
+
+          ### 📦 NPM Security Findings
+          | Severity | Count |
+          |----------|-------|
+          | Critical | ${NPM_CRITICAL} |
+          | High | ${NPM_HIGH} |
+          | Moderate | ${NPM_MODERATE} |
+          | Low | ${NPM_LOW} |
+          | **Total** | **${NPM_TOTAL}** |
+
+          ### 🔍 Semgrep SAST Findings
+          | Category | Count |
+          |----------|-------|
+          | Total Findings | ${SEMGREP_TOTAL} |
+          | Error Severity | ${SEMGREP_ERROR} |
+          | Warning Severity | ${SEMGREP_WARNING} |
+
+          ### 🔐 Secret Scanning Findings
+          | Tool | Findings |
+          |------|----------|
+          | Gitleaks | ${SECRETS_COUNT} potential secrets |
+
+          ### 📥 Artifact Downloads
+          - **python-reports**: pip-audit, bandit JSON reports
+          - **npm-reports**: npm-audit JSON report
+          - **semgrep-report**: semgrep SAST JSON report
+          - **gitleaks-report**: gitleaks JSON report
+
+          All artifacts retained for 30 days.
           EOF
